@@ -1,6 +1,7 @@
 """
 DR Staging Demo - Flask Backend
-Run: pip install flask torch timm einops pillow numpy
+Accepts: fundus image, OCT image, or both — independently.
+Run: pip install flask flask-cors torch timm einops pillow numpy
 Then: python app.py
 """
 
@@ -22,7 +23,6 @@ DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_NAME = "maxvit_tiny_tf_384.in1k"
 IMG_SIZE   = 384
 
-# Update these paths to point to your .pth files
 FUNDUS_PTH = Path(__file__).parent / "best_fundus_hybrid.pth"
 OCT_PTH    = Path(__file__).parent / "best_oct_hybrid.pth"
 
@@ -65,7 +65,6 @@ class Hybrid_Expert(nn.Module):
         )
         self.gem = GeM()
         dim = self.backbone.num_features
-
         self.head_dme = nn.Sequential(nn.Dropout(0.5), nn.Linear(dim, 2))
         self.head_dr  = nn.Sequential(nn.Dropout(0.5), nn.Linear(dim, 3))
 
@@ -83,7 +82,7 @@ def load_model(path: Path) -> Hybrid_Expert:
     return model
 
 
-# ── Image pre-processing ──────────────────────────────────────────────────────
+# ── Pre-processing ────────────────────────────────────────────────────────────
 def preprocess(img_bytes: bytes) -> torch.Tensor:
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
@@ -93,11 +92,9 @@ def preprocess(img_bytes: bytes) -> torch.Tensor:
     return tensor.to(DEVICE)
 
 
-# ── Inference ─────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def predict(model: Hybrid_Expert, img_bytes: bytes) -> dict:
-    x  = preprocess(img_bytes)
-    # TTA: original + horizontal flip
+def run_model(model: Hybrid_Expert, img_bytes: bytes) -> dict:
+    x = preprocess(img_bytes)
     p_dme1, p_dr1 = model(x)
     p_dme2, p_dr2 = model(torch.flip(x, [3]))
 
@@ -122,11 +119,10 @@ def predict(model: Hybrid_Expert, img_bytes: bytes) -> dict:
             "description": DME_DESC[dme_idx],
             "probs":       [round(p * 100, 1) for p in dme_probs],
         },
-        "device": DEVICE,
     }
 
 
-# ── Flask app ─────────────────────────────────────────────────────────────────
+# ── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
@@ -138,7 +134,6 @@ try:
     MODELS_READY = True
 except Exception as e:
     print(f"✗ Could not load models: {e}")
-    print("  → Place best_fundus_hybrid.pth and best_oct_hybrid.pth next to app.py")
     MODELS_READY = False
 
 
@@ -157,19 +152,29 @@ def predict_route():
     if not MODELS_READY:
         return jsonify({"error": "Models not loaded. Check server logs."}), 503
 
-    if "image" not in request.files:
-        return jsonify({"error": "No image uploaded."}), 400
+    fundus_file = request.files.get("fundus")
+    oct_file    = request.files.get("oct")
 
-    img_bytes  = request.files["image"].read()
-    modal_type = request.form.get("type", "fundus")   # "fundus" or "oct"
-    model      = fundus_model if modal_type == "fundus" else oct_model
+    if not fundus_file and not oct_file:
+        return jsonify({"error": "Please upload at least one image (fundus or OCT)."}), 400
 
+    # Validate files have content
+    if fundus_file and fundus_file.filename == "":
+        return jsonify({"error": "Fundus file has no name. Re-upload the file."}), 400
+    if oct_file and oct_file.filename == "":
+        return jsonify({"error": "OCT file has no name. Re-upload the file."}), 400
+
+    result = {"device": DEVICE}
     try:
-        result = predict(model, img_bytes)
-        result["image_type"] = modal_type
-        return jsonify(result)
+        if fundus_file:
+            result["fundus"] = run_model(fundus_model, fundus_file.read())
+        if oct_file:
+            result["oct"] = run_model(oct_model, oct_file.read())
     except Exception as e:
+        print(f"Prediction error: {e}")
         return jsonify({"error": str(e)}), 500
+
+    return jsonify(result)
 
 
 if __name__ == "__main__":
